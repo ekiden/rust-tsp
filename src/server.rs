@@ -1,42 +1,27 @@
 use std::cmp;
 use std::io;
 use std::io::Write;
-use std::net::SocketAddr;
-
-use types::*;
-use super::Application;
-
-
-use bytes::{BigEndian, BytesMut, ByteOrder, BufMut};
 
 use byteorder::WriteBytesExt;
-
+use bytes::{BigEndian, BufMut, ByteOrder, BytesMut};
+use futures::Future;
 use futures::future;
-use futures::{BoxFuture, Future};
-
 use protobuf;
 use protobuf::Message;
-
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Decoder, Encoder, Framed};
-
-use tokio_proto::TcpServer;
 use tokio_proto::pipeline::ServerProto;
-
 use tokio_service::Service;
 
-
-pub fn new<A: Application + Send + Sync + 'static>(listen_addr: SocketAddr, app: &'static A) {
-    let server = TcpServer::new(TSPProto, listen_addr);
-    server.serve(move|| Ok(TSPService{app: app}));
-}
+use application::Application;
+use types::*;
 
 // A codec describes how to go from a bunch of bytes from the wire into a
 // deserialised request. The codec handles the deserialisation from buffer
 // to request as defined in types.proto
-struct TSPCodec;
+pub struct AbciCodec;
 
-impl Decoder for TSPCodec {
+impl Decoder for AbciCodec {
     type Item = Request;
     type Error = io::Error;
 
@@ -48,29 +33,31 @@ impl Decoder for TSPCodec {
 
         let varint_len = buf[0] as usize;
         if varint_len == 0 || varint_len > 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bogus packet length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bogus packet length",
+            ));
         }
 
-        if avail < varint_len+1 {
+        if avail < varint_len + 1 {
             return Ok(None);
         }
 
-        let msg_nbytes = BigEndian::read_uint(&buf[1 .. (varint_len + 1)], varint_len) as usize;
+        let msg_nbytes = BigEndian::read_uint(&buf[1..(varint_len + 1)], varint_len) as usize;
         let header_len = 1 + varint_len;
 
         if (avail - header_len) < msg_nbytes {
             return Ok(None);
         }
 
-        let message = protobuf::core::parse_from_bytes(
-            &buf[header_len .. (header_len + msg_nbytes)]);
+        let message = protobuf::core::parse_from_bytes(&buf[header_len..(header_len + msg_nbytes)]);
         let _ = buf.split_to(header_len + msg_nbytes);
 
         return Ok(message.ok());
     }
 }
 
-impl Encoder for TSPCodec {
+impl Encoder for AbciCodec {
     type Item = Response;
     type Error = io::Error;
 
@@ -90,45 +77,43 @@ impl Encoder for TSPCodec {
         };
 
         writer.write_u8(varint_len as u8)?;
-        writer.write(&msg_len_bytes[(8 - varint_len as usize) ..])?;
+        writer.write(&msg_len_bytes[(8 - varint_len as usize)..])?;
         msg.write_to_writer(&mut writer).unwrap();
 
         Ok(())
     }
 }
 
+pub struct AbciProto;
 
-struct TSPProto;
-
-impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for TSPProto {
+impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for AbciProto {
     type Request = Request;
     type Response = Response;
-    type Transport = Framed<T, TSPCodec>;
+    type Transport = Framed<T, AbciCodec>;
     type BindTransport = Result<Self::Transport, io::Error>;
 
     fn bind_transport(&self, io: T) -> Self::BindTransport {
-        Ok(io.framed(TSPCodec))
+        Ok(io.framed(AbciCodec))
     }
 }
 
-
-struct TSPService {
-    app: &'static Application
+pub struct AbciService {
+    pub app: Box<Application>,
 }
 
-impl Service for TSPService {
+impl Service for AbciService {
     type Request = Request;
     type Response = Response;
     type Error = io::Error;
-    type Future = BoxFuture<Self::Response, Self::Error>;
+    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
     fn call(&self, req: Self::Request) -> Self::Future {
         let response = self.handle(&req);
-        future::ok(response).boxed()
+        Box::new(future::ok(response))
     }
 }
 
-impl TSPService {
+impl AbciService {
     fn handle(&self, request: &Request) -> Response {
         let mut response = Response::new();
 
